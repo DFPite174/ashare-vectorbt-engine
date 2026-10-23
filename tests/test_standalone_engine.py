@@ -77,3 +77,50 @@ def test_vwap_and_impact_cost():
     assert "total_market_impact_paid" in res.metrics
     assert res.metrics["total_market_impact_paid"] > 0.0
     assert "impact_cost" in res.orders_df.columns
+
+
+def test_minute_bars_simulation_and_t1():
+    # 构造跨日分钟级数据测试 T+1 制度与分钟引擎
+    times = [
+        "2025-01-02 09:35:00",
+        "2025-01-02 10:00:00",
+        "2025-01-02 15:00:00",
+        "2025-01-03 09:35:00",
+        "2025-01-03 10:00:00",
+    ]
+    bars = []
+    for t in times:
+        bars.append({
+            "trade_time": t,
+            "symbol": "000001.SZ",
+            "open": 10.0,
+            "high": 10.2,
+            "low": 9.8,
+            "close": 10.0,
+            "volume": 50000,
+            "amount": 500000.0,
+        })
+    bars_df = pd.DataFrame(bars)
+
+    # Day 1 开盘买入并持有，盘中虽然有持仓但 tradable_shares 应仍为 0；Day 2 开盘平仓，应成功解冻并平仓
+    weights = [0.5, 0.5, 0.5, 0.0, 0.0]
+    weights_df = pd.DataFrame({"000001.SZ": weights}, index=times)
+
+    engine = EnhancedVectorBTEngine(ExecutionAssumptions(initial_cash=Decimal("1000000.0")))
+    res = engine.run(bars_df=bars_df, target_weights_df=weights_df)
+
+    orders = res.orders_df
+    # 验证第一笔 09:35 买单成功
+    buy_orders = orders[orders["side"] == "BUY"]
+    assert len(buy_orders) >= 1
+    assert buy_orders.iloc[0]["status"] == "FILLED"
+
+    # 验证 Day 1 整个交易日没有卖单
+    day1_sells = orders[(orders["trade_date"].str.startswith("2025-01-02")) & (orders["side"] == "SELL")]
+    assert len(day1_sells) == 0
+
+    # 验证 Day 2 09:35 成功解冻并卖出平仓
+    day2_sells = orders[(orders["trade_date"] == "2025-01-03 09:35:00") & (orders["side"] == "SELL")]
+    assert len(day2_sells) >= 1
+    assert day2_sells.iloc[0]["status"] == "FILLED"
+

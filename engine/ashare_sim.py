@@ -32,6 +32,7 @@ def simulate_ashare_core_nb(
     down_limit_mat: np.ndarray,  # (n_bars, n_symbols)
     dividend_mat: np.ndarray,    # (n_bars, n_symbols) 现金分红到账矩阵 (元/股)
     rebalance_mask: np.ndarray,  # (n_bars,) bool
+    new_day_mask: np.ndarray,    # (n_bars,) bool 新交易日首根 Bar 标识 (驱动 T+1 跨日解冻)
     adv_mat: np.ndarray,         # (n_bars, n_symbols) 20日日均成交额
     volatility_mat: np.ndarray,  # (n_bars, n_symbols) 标的日度波动率
     initial_cash: float,
@@ -71,15 +72,15 @@ def simulate_ashare_core_nb(
     order_count = 0
 
     for t in range(n_bars):
-        # 1. 交易日开盘前：推进 T+1 时钟并派发现金分红
-        for s in range(n_symbols):
-            tradable_shares[s] += locked_shares_today[s]
-            locked_shares_today[s] = 0.0
+        # 1. 交易日开盘推进：仅在新交易日首根 Bar 推进 T+1 时钟并派发现金分红 (精准支持分钟线与日线)
+        if new_day_mask[t]:
+            for s in range(n_symbols):
+                tradable_shares[s] += locked_shares_today[s]
+                locked_shares_today[s] = 0.0
 
-            # 公司行为：现金分红到账
-            div_val = dividend_mat[t, s]
-            if div_val > 0.0 and current_shares[s] > 0.0:
-                cash += current_shares[s] * div_val
+                div_val = dividend_mat[t, s]
+                if div_val > 0.0 and current_shares[s] > 0.0:
+                    cash += current_shares[s] * div_val
 
         # 2. 检查当日是否触发调仓信号
         if rebalance_mask[t]:
@@ -278,12 +279,23 @@ class EnhancedVectorBTEngine:
         price_limits_df: Optional[pd.DataFrame] = None,
         corporate_actions_df: Optional[pd.DataFrame] = None,
     ) -> VectorBTResult:
-        pivoted_close = bars_df.pivot(index="trade_date", columns="symbol", values="close").ffill().bfill()
-        pivoted_high = bars_df.pivot(index="trade_date", columns="symbol", values="high").ffill().bfill()
-        pivoted_low = bars_df.pivot(index="trade_date", columns="symbol", values="low").ffill().bfill()
+        # 1. 规范化维度与对齐 (自动适配日线 trade_date 或分钟线 trade_time)
+        time_col = "trade_time" if "trade_time" in bars_df.columns else "trade_date"
+        pivoted_close = bars_df.pivot(index=time_col, columns="symbol", values="close").ffill().bfill()
+        pivoted_high = bars_df.pivot(index=time_col, columns="symbol", values="high").ffill().bfill()
+        pivoted_low = bars_df.pivot(index=time_col, columns="symbol", values="low").ffill().bfill()
 
         timeline = sorted(list(pivoted_close.index))
         symbols = sorted(list(pivoted_close.columns))
+
+        # 提取日期序列与跨日 T+1 首根 Bar 解冻掩码
+        dates_str = [str(t)[:10] for t in timeline]
+        new_day_bool = np.zeros(len(timeline), dtype=np.bool_)
+        new_day_bool[0] = True
+        for i in range(1, len(timeline)):
+            if dates_str[i] != dates_str[i - 1]:
+                new_day_bool[i] = True
+        new_day_mask_arr = np.ascontiguousarray(new_day_bool, dtype=np.bool_)
 
         aligned_weights = target_weights_df.reindex(index=timeline, columns=symbols).fillna(0.0)
 
@@ -295,8 +307,9 @@ class EnhancedVectorBTEngine:
             rebalance_bool = rebalance_mask.reindex(timeline).fillna(False).values
 
         if price_limits_df is not None and "up_limit" in price_limits_df.columns:
-            up_lim_piv = price_limits_df.pivot(index="trade_date", columns="symbol", values="up_limit").reindex(index=timeline, columns=symbols)
-            down_lim_piv = price_limits_df.pivot(index="trade_date", columns="symbol", values="down_limit").reindex(index=timeline, columns=symbols)
+            lim_col = "trade_time" if "trade_time" in price_limits_df.columns else "trade_date"
+            up_lim_piv = price_limits_df.pivot(index=lim_col, columns="symbol", values="up_limit").reindex(index=timeline, columns=symbols)
+            down_lim_piv = price_limits_df.pivot(index=lim_col, columns="symbol", values="down_limit").reindex(index=timeline, columns=symbols)
             up_limit_mat = up_lim_piv.fillna(999999.0).values
             down_limit_mat = down_lim_piv.fillna(0.0).values
         else:
@@ -330,13 +343,13 @@ class EnhancedVectorBTEngine:
             b_df = bars_df.copy()
             v_safe = b_df["volume"].replace(0, np.nan)
             b_df["vwap"] = (b_df["amount"] / v_safe).fillna(b_df["close"])
-            pivoted_exec = b_df.pivot(index="trade_date", columns="symbol", values="vwap").ffill().bfill().reindex(index=timeline, columns=symbols)
+            pivoted_exec = b_df.pivot(index=time_col, columns="symbol", values="vwap").ffill().bfill().reindex(index=timeline, columns=symbols)
             exec_price_mat = np.ascontiguousarray(pivoted_exec.values, dtype=np.float64)
         else:
             exec_price_mat = close_mat
 
         if "amount" in bars_df.columns:
-            pivoted_amount = bars_df.pivot(index="trade_date", columns="symbol", values="amount").ffill().bfill().reindex(index=timeline, columns=symbols)
+            pivoted_amount = bars_df.pivot(index=time_col, columns="symbol", values="amount").ffill().bfill().reindex(index=timeline, columns=symbols)
             adv_df = pivoted_amount.rolling(20, min_periods=1).mean().fillna(10000000.0)
             adv_mat = np.ascontiguousarray(adv_df.values, dtype=np.float64)
         else:
@@ -356,6 +369,7 @@ class EnhancedVectorBTEngine:
             down_limit_mat=down_limit_mat,
             dividend_mat=dividend_mat,
             rebalance_mask=rebalance_mask_arr,
+            new_day_mask=new_day_mask_arr,
             adv_mat=adv_mat,
             volatility_mat=volatility_mat,
             initial_cash=float(self.assumptions.initial_cash),
@@ -375,11 +389,15 @@ class EnhancedVectorBTEngine:
         cash_series = pd.Series(cash_arr, index=timeline, name="cash")
         positions_df = pd.DataFrame(pos_arr, index=timeline, columns=symbols)
 
-        daily_returns = equity_series.pct_change().fillna(0.0)
         total_ret = (equity_series.iloc[-1] / equity_series.iloc[0]) - 1.0
 
-        n_days = len(timeline)
-        annualized_ret = (1.0 + total_ret) ** (252.0 / max(n_days, 1)) - 1.0
+        unique_days = len(set(dates_str))
+        annualized_ret = (1.0 + total_ret) ** (252.0 / max(unique_days, 1)) - 1.0
+
+        # 分钟线聚合至日末净值，计算标准年化夏普比率
+        df_equity = pd.DataFrame({"equity": equity_arr, "date": dates_str}, index=timeline)
+        daily_equity_series = df_equity.groupby("date")["equity"].last()
+        daily_returns = daily_equity_series.pct_change().fillna(0.0)
 
         ret_std = daily_returns.std()
         sharpe = (daily_returns.mean() / ret_std * np.sqrt(252.0)) if ret_std > 1e-8 else 0.0
@@ -428,7 +446,7 @@ class EnhancedVectorBTEngine:
         ])
 
         avg_equity = equity_series.mean()
-        annualized_turnover = (total_turnover_val / max(avg_equity, 1.0)) * (252.0 / max(n_days, 1))
+        annualized_turnover = (total_turnover_val / max(avg_equity, 1.0)) * (252.0 / max(unique_days, 1))
 
         metrics = {
             "initial_cash": float(self.assumptions.initial_cash),
