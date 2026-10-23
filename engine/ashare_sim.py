@@ -338,11 +338,19 @@ class EnhancedVectorBTEngine:
         dividend_mat = np.ascontiguousarray(dividend_mat, dtype=np.float64)
         rebalance_mask_arr = np.ascontiguousarray(rebalance_bool, dtype=np.bool_)
 
+        # 撮合价格基准推导 (Close vs VWAP)
         price_mode_str = str(getattr(self.assumptions, "price_mode", "CLOSE")).upper()
         if ("VWAP" in price_mode_str) and ("amount" in bars_df.columns) and ("volume" in bars_df.columns):
             b_df = bars_df.copy()
             v_safe = b_df["volume"].replace(0, np.nan)
-            b_df["vwap"] = (b_df["amount"] / v_safe).fillna(b_df["close"])
+            raw_ratio = b_df["amount"] / v_safe
+            # 智能单位校准：Tushare 日线 amount 为千元、vol 为手(100股)，raw_ratio 约为真实单价的 1/10；
+            # 分钟线 amount 为元、vol 为股，raw_ratio 即为真实单价。
+            close_col = b_df["close"]
+            unit_factor = np.where((raw_ratio > 0) & (raw_ratio < close_col * 0.3), 10.0, 1.0)
+            calibrated_vwap = (raw_ratio * unit_factor).fillna(close_col)
+            # 物理约束严格夹逼：VWAP 绝不可能超越当日 [low, high] 价格区间
+            b_df["vwap"] = calibrated_vwap.clip(lower=b_df["low"], upper=b_df["high"])
             pivoted_exec = b_df.pivot(index=time_col, columns="symbol", values="vwap").ffill().bfill().reindex(index=timeline, columns=symbols)
             exec_price_mat = np.ascontiguousarray(pivoted_exec.values, dtype=np.float64)
         else:
