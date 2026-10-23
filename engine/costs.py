@@ -65,6 +65,41 @@ def calc_effective_price_nb(
     return price
 
 
+@nb.njit(fastmath=True)
+def calc_market_impact_nb(
+    trade_amount: float,
+    adv: float,
+    volatility: float,
+    eta: float = 0.10,
+) -> float:
+    """
+    平方根流动性冲击成本模型:
+    Impact Cost = eta * sigma * sqrt(Trade Amount / ADV)
+    """
+    if adv <= 1000.0 or trade_amount <= 0.0 or volatility <= 0.0:
+        return 0.0
+    participation = trade_amount / adv
+    if participation > 1.0:
+        participation = 1.0
+    return eta * volatility * np.sqrt(participation)
+
+
+@nb.njit(fastmath=True)
+def calc_effective_price_with_impact_nb(
+    side: int,  # 1 for BUY, -1 for SELL
+    price: float,
+    slippage_rate: float = 0.0005,
+    impact_rate: float = 0.0,
+) -> float:
+    """综合固定滑点与非线性流动性冲击的最终成交价"""
+    total_friction = slippage_rate + impact_rate
+    if side == 1:
+        return price * (1.0 + total_friction)
+    elif side == -1:
+        return price * (1.0 - total_friction)
+    return price
+
+
 class AShareCostModel:
     def __init__(self, config: AShareCostConfig | None = None):
         self.config = config or AShareCostConfig()

@@ -15,6 +15,11 @@ class OrderSide(str, Enum):
     SELL = "SELL"
 
 
+class ExecutionPriceMode(str, Enum):
+    CLOSE = "CLOSE"
+    VWAP = "VWAP"
+
+
 class ExecutionAssumptions(BaseModel):
     """交易制度假设"""
     model_config = ConfigDict(frozen=True)
@@ -26,6 +31,9 @@ class ExecutionAssumptions(BaseModel):
     transfer_fee_rate: Decimal = Field(default=Decimal("0.00001"), description="双边过户费 (十万分之一)")
     slippage: Decimal = Field(default=Decimal("0.01"), description="固定滑点")
     t_plus_one: bool = Field(default=True, description="A 股 T+1 约束")
+    price_mode: ExecutionPriceMode = Field(default=ExecutionPriceMode.CLOSE, description="撮合模式")
+    impact_cost_coef: Decimal = Field(default=Decimal("0.10"), description="平方根市场冲击成本系数 eta")
+    enable_impact_cost: bool = Field(default=False, description="是否启用平方根流动性冲击成本模型")
 
 
 class TargetWeights(BaseModel):
